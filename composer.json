@@ -1,0 +1,11 @@
+{
+    "name": "r2cloudflare/uploader",
+    "description": "Upload de arquivos seguro para Cloudflare R2",
+    "require": {
+        "aws/aws-sdk-php": "^3.283"
+    },
+    "config": {
+        "optimize-autoloader": true,
+        "preferred-install": "dist"
+    }
+}

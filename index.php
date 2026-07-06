@@ -1,0 +1,945 @@
+<?php
+/**
+ * Uploader Seguro para Cloudflare R2 via Presigned URLs
+ * Compatível com PHP 8.2+ e servidores LiteSpeed / Hostinger
+ * 
+ * Permite upload direto do navegador para o Cloudflare R2,
+ * mitigando timeouts e consumo de banda na hospedagem compartilhada.
+ */
+
+// Iniciar sessão com flags estritos de segurança
+session_start([
+    'cookie_lifetime' => 0,
+    'cookie_path' => '/',
+    'cookie_secure' => isset($_SERVER['HTTPS']),
+    'cookie_httponly' => true,
+    'cookie_samesite' => 'Strict',
+    'use_only_cookies' => true
+]);
+
+// Evitar indexação de mecanismos de busca por header HTTP
+header("X-Robots-Tag: noindex, nofollow, noarchive", true);
+
+// Carregar configurações confidenciais
+$configPath = __DIR__ . '/env.php';
+if (!file_exists($configPath)) {
+    http_response_code(500);
+    exit('Erro de Configuração: O arquivo env.php nao foi encontrado.');
+}
+$config = require $configPath;
+
+// Habilitar logs e ocultar exibição de erros dependendo do ambiente
+if (($config['APP_ENV'] ?? 'production') === 'development') {
+    ini_set('display_errors', '1');
+    error_reporting(E_ALL);
+} else {
+    ini_set('display_errors', '0');
+    error_reporting(0);
+}
+
+// Gerar Token CSRF se não existir
+if (empty($_SESSION['csrf_token'])) {
+    $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
+}
+
+// Autoload do Composer
+$autoloadPath = __DIR__ . '/vendor/autoload.php';
+$hasComposer = file_exists($autoloadPath);
+if ($hasComposer) {
+    require_once $autoloadPath;
+}
+
+// Helper para gerar UUID v4 criptograficamente seguro
+function generate_uuidv4(): string {
+    $data = random_bytes(16);
+    $data[6] = chr(ord($data[6]) & 0x0f | 0x40); // Versão 4
+    $data[8] = chr(ord($data[8]) & 0x3f | 0x80); // Variante RFC 4122
+    return vsprintf('%s%s-%s-%s-%s-%s%s%s', str_split(bin2hex($data), 4));
+}
+
+// Helper para sanitizar nomes de arquivos de forma amigável e segura
+function sanitize_filename(string $filename): string {
+    $pathInfo = pathinfo($filename);
+    $name = $pathInfo['filename'] ?? '';
+    $ext = isset($pathInfo['extension']) ? strtolower($pathInfo['extension']) : '';
+
+    // Dicionário de conversão de acentos e caracteres especiais para compatibilidade global
+    $accentMap = [
+        'á'=>'a', 'à'=>'a', 'â'=>'a', 'ã'=>'a', 'ä'=>'a', 'å'=>'a', 'æ'=>'ae',
+        'é'=>'e', 'è'=>'e', 'ê'=>'e', 'ë'=>'e', 'í'=>'i', 'ì'=>'i', 'î'=>'i', 'ï'=>'i',
+        'ó'=>'o', 'ò'=>'o', 'ô'=>'o', 'õ'=>'o', 'ö'=>'o', 'ø'=>'o', 'œ'=>'oe',
+        'ú'=>'u', 'ù'=>'u', 'û'=>'u', 'ü'=>'u', 'ç'=>'c', 'ñ'=>'n',
+        'Á'=>'A', 'À'=>'A', 'Â'=>'A', 'Ã'=>'A', 'Ä'=>'A', 'Å'=>'A', 'Æ'=>'AE',
+        'É'=>'E', 'È'=>'E', 'Ê'=>'E', 'Ë'=>'E', 'Í'=>'I', 'Ì'=>'I', 'Î'=>'I', 'Ï'=>'I',
+        'Ó'=>'O', 'Ò'=>'O', 'Ô'=>'O', 'Õ'=>'O', 'Ö'=>'O', 'Ø'=>'O', 'Œ'=>'OE',
+        'Ú'=>'U', 'Ù'=>'U', 'Û'=>'U', 'Ü'=>'U', 'Ç'=>'C', 'Ñ'=>'N'
+    ];
+    $name = strtr($name, $accentMap);
+    $name = strtolower($name);
+
+    // Substituir qualquer caractere não alfanumérico por hífen
+    $name = preg_replace('/[^a-z0-9_\-]/', '-', $name);
+    // Substituir múltiplos delimitadores por um único
+    $name = preg_replace('/[\-_]+/', '-', $name);
+    // Limpar delimitadores das bordas
+    $name = trim($name, '-_');
+
+    if (empty($name)) {
+        $name = 'arquivo';
+    }
+
+    return $ext ? $name . '.' . $ext : $name;
+}
+
+// Helper para comparação de strings em tempo constante (segurança anti-timing attacks)
+function safe_compare(string $known, string $user): bool {
+    return hash_equals($known, $user);
+}
+
+// Helper para gravar logs de depuração locais
+function write_log(string $message): void {
+    global $config;
+    if (empty($config['ENABLE_DEBUG_LOG'])) {
+        return;
+    }
+    $logFile = __DIR__ . '/uploader.log';
+    $timestamp = date('Y-m-d H:i:s');
+    $logMessage = "[{$timestamp}] {$message}" . PHP_EOL;
+    @file_put_contents($logFile, $logMessage, FILE_APPEND);
+}
+
+// Roteamento de Ações do Backend
+$error = '';
+$successLink = '';
+
+// 1. Processo de Login
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['action'] === 'login') {
+    // Validação de Honeypot (campo oculto invisível a humanos)
+    if (!empty($_POST['username'])) {
+        usleep(rand(500000, 1500000));
+        header("Location: index.php");
+        exit;
+    }
+
+    // Validação do Token CSRF
+    if (empty($_POST['csrf_token']) || !safe_compare($_SESSION['csrf_token'], $_POST['csrf_token'])) {
+        $error = 'Token de seguranca invalido. Tente novamente.';
+    } else {
+        $password = $_POST['password'] ?? '';
+        $storedHash = $config['UPLOAD_PASSWORD_HASH'] ?? '';
+
+        if (password_verify($password, $storedHash)) {
+            session_regenerate_id(true);
+            $_SESSION['authenticated'] = true;
+            header("Location: index.php");
+            exit;
+        } else {
+            usleep(rand(500000, 1000000));
+            $error = 'Senha incorreta.';
+        }
+    }
+}
+
+// 2. Processo de Logout
+if (isset($_GET['action']) && $_GET['action'] === 'logout') {
+    $_SESSION = [];
+    if (ini_get("session.use_cookies")) {
+        $params = session_get_cookie_params();
+        setcookie(session_name(), '', time() - 42000,
+            $params["path"], $params["domain"],
+            $params["secure"], $params["httponly"]
+        );
+    }
+    session_destroy();
+    header("Location: index.php");
+    exit;
+}
+
+// Verificação de autenticação
+$isAuthenticated = !empty($_SESSION['authenticated']);
+
+// 3. Processo de Geração de Presigned URL (Somente Autenticados)
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_GET['action']) && $_GET['action'] === 'get_presigned_url') {
+    header('Content-Type: application/json');
+
+    if (!$isAuthenticated) {
+        write_log("Erro de Autenticacao: Tentativa de geracao de URL pre-assinada sem login.");
+        http_response_code(403);
+        echo json_encode(['error' => 'Acesso nao autorizado. Faca o login novamente.']);
+        exit;
+    }
+
+    // Capturar o JSON enviado pelo navegador
+    $jsonInput = file_get_contents('php://input');
+    $requestData = json_decode($jsonInput, true);
+
+    if (!$requestData) {
+        write_log("Erro na requisicao: JSON invalido.");
+        http_response_code(400);
+        echo json_encode(['error' => 'Dados de requisicao invalidos.']);
+        exit;
+    }
+
+    // Validação do Token CSRF
+    $csrfToken = $requestData['csrf_token'] ?? $_SERVER['HTTP_X_CSRF_TOKEN'] ?? '';
+    if (empty($csrfToken) || !safe_compare($_SESSION['csrf_token'], $csrfToken)) {
+        write_log("Erro de CSRF: Token CSRF invalido na geracao de URL assinada.");
+        http_response_code(400);
+        echo json_encode(['error' => 'Token CSRF invalido ou expirado.']);
+        exit;
+    }
+
+    // Validação do Honeypot de Upload
+    if (!empty($requestData['upload_honeypot'])) {
+        write_log("Honeypot de upload preenchido (Bot detectado na requisicao de URL assinada).");
+        http_response_code(200);
+        echo json_encode(['success' => true, 'url' => 'https://example.com/honeypot_active']);
+        exit;
+    }
+
+    if (!$hasComposer) {
+        write_log("Erro no servidor: Dependencias do Composer (AWS SDK) ausentes.");
+        http_response_code(500);
+        echo json_encode(['error' => 'Dependencias do R2 ausentes no servidor. Execute "composer install".']);
+        exit;
+    }
+
+    $fileNameOriginal = $requestData['fileName'] ?? '';
+    $fileSize = (int) ($requestData['fileSize'] ?? 0);
+    $mimeType = $requestData['mimeType'] ?? 'application/octet-stream';
+
+    if (empty($fileNameOriginal)) {
+        write_log("Erro: Nome de arquivo nao informado.");
+        http_response_code(400);
+        echo json_encode(['error' => 'Nome do arquivo nao fornecido.']);
+        exit;
+    }
+
+    // Validar Tamanho Máximo (500MB para upload direto)
+    $maxFileSize = 500 * 1024 * 1024; // 500MB
+    if ($fileSize > $maxFileSize) {
+        write_log("Arquivo excede limite de 500MB. Tamanho relatado: {$fileSize} bytes");
+        http_response_code(400);
+        echo json_encode(['error' => 'O arquivo excede o limite maximo de seguranca de 500MB.']);
+        exit;
+    }
+
+    // Sanitizar nome e extensão
+    $pathInfo = pathinfo($fileNameOriginal);
+    $extension = isset($pathInfo['extension']) ? strtolower($pathInfo['extension']) : '';
+
+    // Whitelist estrita de extensões permitidas
+    $allowedExtensions = ['exe', 'zip', 'rar', '7z', 'pdf', 'png', 'jpg', 'jpeg', 'gif', 'txt', 'csv', 'mp4'];
+    if (!in_array($extension, $allowedExtensions, true)) {
+        write_log("Extensao nao permitida: '{$extension}'");
+        http_response_code(400);
+        echo json_encode(['error' => 'Extensao de arquivo nao permitida por motivos de seguranca.']);
+        exit;
+    }
+
+    // Proteção extra contra MIME-Types perigosos de script
+    $blockedMimes = ['text/html', 'application/x-httpd-php', 'text/javascript', 'application/javascript'];
+    if (in_array($mimeType, $blockedMimes, true)) {
+        write_log("MIME bloqueado na assinatura: '{$mimeType}'");
+        http_response_code(400);
+        echo json_encode(['error' => 'Tipo de conteudo invalido ou malicioso detectado.']);
+        exit;
+    }
+
+    // Gerar nome de arquivo higienizado baseado no nome original (sobrescreve arquivos iguais no R2)
+    $newFileName = sanitize_filename($fileNameOriginal);
+    $friendlyName = $newFileName;
+
+    try {
+        write_log("Preparando URL pre-assinada para arquivo original: '{$fileNameOriginal}' | Nome no R2: '{$newFileName}'");
+
+        // Inicializar Cliente do Cloudflare R2
+        $s3Client = new Aws\S3\S3Client([
+            'credentials' => [
+                'key'    => $config['R2_ACCESS_KEY'],
+                'secret' => $config['R2_SECRET_KEY'],
+            ],
+            'region' => 'auto',
+            'endpoint' => "https://" . $config['R2_ACCOUNT_ID'] . ".r2.cloudflarestorage.com",
+            'version' => 'latest',
+            'use_path_style_endpoint' => true,
+            'http' => [
+                'verify' => false, // Evita falhas de SSL em servidores com certificados CA desatualizados
+            ],
+        ]);
+
+        $bucket = $config['R2_BUCKET_NAME'];
+        
+        // Se for um executável, usar cabeçalho para download forçado (attachment)
+        $contentDisposition = ($extension === 'exe') 
+            ? 'attachment; filename="' . $friendlyName . '"'
+            : 'inline; filename="' . $friendlyName . '"';
+
+        // Montar o comando PutObject
+        $cmd = $s3Client->getCommand('PutObject', [
+            'Bucket' => $bucket,
+            'Key'    => $newFileName,
+            'ContentType' => $mimeType,
+            'ContentDisposition' => $contentDisposition,
+        ]);
+
+        // Gerar a URL pré-assinada válida por 20 minutos
+        $request = $s3Client->createPresignedRequest($cmd, '+20 minutes');
+        $presignedUrl = (string) $request->getUri();
+
+        // Gerar a URL pública final onde o arquivo estará acessível após o upload
+        $publicBaseUrl = rtrim($config['R2_PUBLIC_URL'], '/');
+        $publicUrl = $publicBaseUrl . '/' . $newFileName;
+
+        write_log("URL pre-assinada gerada com sucesso. Validade: 20 min.");
+
+        echo json_encode([
+            'success' => true,
+            'presignedUrl' => $presignedUrl,
+            'publicUrl' => $publicUrl,
+            'friendlyName' => $friendlyName,
+            'contentDisposition' => $contentDisposition
+        ]);
+        exit;
+
+    } catch (Throwable $e) {
+        write_log("FALHA NA GERACAO DA URL ASSINADA: " . $e->getMessage() . "\nTrace:\n" . $e->getTraceAsString());
+        http_response_code(500);
+        $errorMsg = (($config['APP_ENV'] ?? 'production') === 'development') 
+            ? 'Erro R2: ' . $e->getMessage() 
+            : 'Erro interno ao preparar a conexao com o Cloudflare R2.';
+        echo json_encode(['error' => $errorMsg]);
+        exit;
+    }
+}
+
+// Renderização do HTML (Frontend)
+?>
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Painel de Armazenamento Anonimo</title>
+    <!-- Impedir indexação por bots de busca -->
+    <meta name="robots" content="noindex, nofollow, noarchive, nosnippet">
+    <!-- Fonte Inter Google Fonts -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    
+    <style>
+        :root {
+            --bg-color: #080c14;
+            --card-bg: rgba(17, 24, 39, 0.75);
+            --border-color: rgba(75, 85, 99, 0.3);
+            --text-primary: #f3f4f6;
+            --text-secondary: #9ca3af;
+            --accent-start: #6366f1; /* Indigo */
+            --accent-end: #a855f7;   /* Purple */
+            --accent-hover: #4f46e5;
+            --success-color: #10b981;
+            --error-color: #ef4444;
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: var(--bg-color);
+            color: var(--text-primary);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 1.5rem;
+            position: relative;
+            overflow-x: hidden;
+        }
+
+        /* Efeito de luz decorativo de fundo (moderno) */
+        body::before {
+            content: '';
+            position: absolute;
+            width: 400px;
+            height: 400px;
+            background: radial-gradient(circle, rgba(99, 102, 241, 0.15) 0%, rgba(0,0,0,0) 70%);
+            top: -100px;
+            left: -100px;
+            z-index: -1;
+        }
+        body::after {
+            content: '';
+            position: absolute;
+            width: 500px;
+            height: 500px;
+            background: radial-gradient(circle, rgba(168, 85, 247, 0.12) 0%, rgba(0,0,0,0) 70%);
+            bottom: -150px;
+            right: -150px;
+            z-index: -1;
+        }
+
+        .container {
+            width: 100%;
+            max-width: 480px;
+            z-index: 10;
+        }
+
+        .card {
+            background-color: var(--card-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 18px;
+            padding: 2.5rem 2rem;
+            box-shadow: 0 20px 40px -15px rgba(0, 0, 0, 0.7);
+            backdrop-filter: blur(16px);
+            -webkit-backdrop-filter: blur(16px);
+            transition: transform 0.3s ease, box-shadow 0.3s ease;
+        }
+
+        .card-header {
+            text-align: center;
+            margin-bottom: 2rem;
+        }
+
+        .card-title {
+            font-size: 1.5rem;
+            font-weight: 700;
+            background: linear-gradient(135deg, var(--text-primary) 30%, var(--text-secondary) 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            margin-bottom: 0.5rem;
+        }
+
+        .card-subtitle {
+            font-size: 0.875rem;
+            color: var(--text-secondary);
+            font-weight: 400;
+        }
+
+        /* Alertas de erro/sucesso */
+        .alert {
+            padding: 0.875rem 1rem;
+            border-radius: 10px;
+            font-size: 0.875rem;
+            margin-bottom: 1.5rem;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            animation: fadeIn 0.3s ease;
+        }
+        .alert-error {
+            background-color: rgba(239, 68, 68, 0.1);
+            border: 1px solid rgba(239, 68, 68, 0.25);
+            color: var(--error-color);
+        }
+        .alert-success {
+            background-color: rgba(16, 185, 129, 0.1);
+            border: 1px solid rgba(16, 185, 129, 0.25);
+            color: var(--success-color);
+        }
+
+        /* Formulários */
+        .form-group {
+            margin-bottom: 1.25rem;
+            position: relative;
+        }
+
+        .form-label {
+            display: block;
+            font-size: 0.8125rem;
+            color: var(--text-secondary);
+            font-weight: 500;
+            margin-bottom: 0.5rem;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+        }
+
+        .form-input {
+            width: 100%;
+            padding: 0.875rem 1rem;
+            background-color: rgba(31, 41, 55, 0.5);
+            border: 1px solid var(--border-color);
+            border-radius: 10px;
+            color: var(--text-primary);
+            font-size: 0.95rem;
+            transition: all 0.2s ease;
+            outline: none;
+        }
+
+        .form-input:focus {
+            border-color: var(--accent-start);
+            box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.15);
+            background-color: rgba(31, 41, 55, 0.8);
+        }
+
+        /* Botões */
+        .btn {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            width: 100%;
+            padding: 0.875rem 1rem;
+            background: linear-gradient(135deg, var(--accent-start) 0%, var(--accent-end) 100%);
+            border: none;
+            border-radius: 10px;
+            color: #ffffff;
+            font-size: 0.95rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            box-shadow: 0 4px 12px rgba(99, 102, 241, 0.25);
+        }
+
+        .btn:hover {
+            transform: translateY(-1px);
+            box-shadow: 0 6px 16px rgba(99, 102, 241, 0.35);
+            opacity: 0.95;
+        }
+
+        .btn:active {
+            transform: translateY(1px);
+        }
+
+        .btn-logout {
+            background: transparent;
+            border: 1px solid var(--border-color);
+            box-shadow: none;
+            color: var(--text-secondary);
+            margin-top: 1.5rem;
+            font-size: 0.8125rem;
+            padding: 0.625rem;
+        }
+
+        .btn-logout:hover {
+            background-color: rgba(239, 68, 68, 0.1);
+            border-color: rgba(239, 68, 68, 0.3);
+            color: var(--error-color);
+            box-shadow: none;
+        }
+
+        /* Dropzone Component */
+        .dropzone {
+            border: 2px dashed rgba(99, 102, 241, 0.4);
+            background-color: rgba(31, 41, 55, 0.25);
+            border-radius: 14px;
+            padding: 3rem 1.5rem;
+            text-align: center;
+            cursor: pointer;
+            transition: all 0.25s ease;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 1rem;
+        }
+
+        .dropzone.dragover {
+            border-color: var(--accent-end);
+            background-color: rgba(168, 85, 247, 0.08);
+            transform: scale(1.02);
+        }
+
+        .dropzone-icon {
+            width: 48px;
+            height: 48px;
+            color: var(--accent-start);
+            transition: transform 0.3s ease;
+        }
+
+        .dropzone:hover .dropzone-icon {
+            transform: translateY(-4px);
+        }
+
+        .dropzone-text {
+            font-size: 0.9rem;
+            color: var(--text-secondary);
+            line-height: 1.5;
+        }
+
+        .dropzone-text strong {
+            color: var(--text-primary);
+        }
+
+        .file-input {
+            display: none;
+        }
+
+        /* Barra de Progresso do Upload */
+        .progress-container {
+            display: none;
+            margin-top: 1.5rem;
+            text-align: left;
+        }
+
+        .progress-header {
+            display: flex;
+            justify-content: space-between;
+            font-size: 0.75rem;
+            color: var(--text-secondary);
+            margin-bottom: 0.5rem;
+        }
+
+        .progress-bar-wrapper {
+            width: 100%;
+            height: 6px;
+            background-color: rgba(31, 41, 55, 0.8);
+            border-radius: 999px;
+            overflow: hidden;
+        }
+
+        .progress-bar {
+            width: 0%;
+            height: 100%;
+            background: linear-gradient(90deg, var(--accent-start) 0%, var(--accent-end) 100%);
+            border-radius: 999px;
+            transition: width 0.1s linear;
+        }
+
+        /* Resultado do Upload */
+        .result-container {
+            display: none;
+            margin-top: 1.5rem;
+            animation: fadeIn 0.4s ease;
+        }
+
+        .result-title {
+            font-size: 0.875rem;
+            color: var(--success-color);
+            font-weight: 600;
+            margin-bottom: 0.75rem;
+            display: flex;
+            align-items: center;
+            gap: 0.25rem;
+        }
+
+        .copy-group {
+            display: flex;
+            gap: 0.5rem;
+        }
+
+        .copy-input {
+            flex-grow: 1;
+            font-family: monospace;
+            font-size: 0.8rem;
+            background-color: rgba(17, 24, 39, 0.9);
+            border-color: rgba(16, 185, 129, 0.3);
+            text-overflow: ellipsis;
+        }
+
+        .btn-copy {
+            width: auto;
+            min-width: 90px;
+            background: var(--card-bg);
+            border: 1px solid var(--border-color);
+            box-shadow: none;
+            padding: 0.5rem 1rem;
+            font-size: 0.8rem;
+        }
+
+        .btn-copy:hover {
+            background-color: var(--border-color);
+            box-shadow: none;
+        }
+
+        .btn-copy.success {
+            background-color: rgba(16, 185, 129, 0.1);
+            border-color: var(--success-color);
+            color: var(--success-color);
+        }
+
+        /* Notificação de dependência */
+        .composer-warning {
+            background-color: rgba(239, 68, 68, 0.05);
+            border: 1px solid rgba(239, 68, 68, 0.2);
+            color: var(--text-secondary);
+            font-size: 0.75rem;
+            padding: 0.75rem;
+            border-radius: 8px;
+            margin-top: 1rem;
+            text-align: center;
+        }
+
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(8px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <div class="card">
+        
+        <?php if (!$isAuthenticated): ?>
+            <!-- TELA DE LOGIN -->
+            <div class="card-header">
+                <h1 class="card-title">Acesso Restrito</h1>
+                <p class="card-subtitle">Insira a chave secreta para carregar arquivos</p>
+            </div>
+
+            <?php if (!empty($error)): ?>
+                <div class="alert alert-error">
+                    <svg width="16" height="16" fill="currentColor" viewBox="0 0 16 16"><path d="M8.982 1.566a1.13 1.13 0 0 0-1.96 0L.165 13.233c-.457.778.091 1.767.98 1.767h13.713c.889 0 1.438-.99.98-1.767L8.982 1.566zM8 5c.535 0 .954.462.9.995l-.35 3.507a.552.552 0 0 1-1.1 0L7.1 5.995A.905.905 0 0 1 8 5zm.002 6a1 1 0 1 1 0 2 1 1 0 0 1 0-2z"/></svg>
+                    <span><?= htmlspecialchars($error, ENT_QUOTES, 'UTF-8') ?></span>
+                </div>
+            <?php endif; ?>
+
+            <form action="index.php" method="POST" autocomplete="off">
+                <input type="hidden" name="action" value="login">
+                <input type="hidden" name="csrf_token" value="<?= htmlspecialchars($_SESSION['csrf_token'], ENT_QUOTES, 'UTF-8') ?>">
+                
+                <!-- Honeypot para detecção de bots (invisível a humanos) -->
+                <div style="display:none !important;">
+                    <input type="text" name="username" tabindex="-1" autocomplete="off">
+                </div>
+
+                <div class="form-group">
+                    <label for="password" class="form-label">Chave de Acesso</label>
+                    <input type="password" id="password" name="password" class="form-input" placeholder="••••••••••••" required autofocus>
+                </div>
+
+                <button type="submit" class="btn">Entrar no Painel</button>
+            </form>
+
+        <?php else: ?>
+            <!-- PAINEL DE UPLOAD (AUTENTICADO) -->
+            <div class="card-header">
+                <h1 class="card-title">Carregar Arquivo</h1>
+                <p class="card-subtitle">Suba arquivos de grande porte direto para o Cloudflare R2</p>
+            </div>
+
+            <div id="js-alert" class="alert" style="display: none;"></div>
+
+            <!-- Dropzone central -->
+            <div class="dropzone" id="dropzone">
+                <svg class="dropzone-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12"></path>
+                </svg>
+                <p class="dropzone-text">
+                    <strong>Clique para selecionar</strong> ou arraste o arquivo aqui.<br>
+                    <span style="font-size: 0.75rem; color: var(--text-secondary);">
+                        Extensões seguras permitidas (incluindo .exe)
+                    </span>
+                </p>
+                <input type="file" id="file-input" class="file-input">
+            </div>
+
+            <!-- Barra de Progresso -->
+            <div class="progress-container" id="progress-container">
+                <div class="progress-header">
+                    <span id="file-name">Carregando arquivo...</span>
+                    <span id="progress-percent">0%</span>
+                </div>
+                <div class="progress-bar-wrapper">
+                    <div class="progress-bar" id="progress-bar"></div>
+                </div>
+            </div>
+
+            <!-- Resultado com link copiável -->
+            <div class="result-container" id="result-container">
+                <div class="result-title">
+                    <svg width="16" height="16" fill="currentColor" viewBox="0 0 16 16"><path d="M16 8A8 8 0 1 1 0 8a8 8 0 0 1 16 0zm-3.97-3.03a.75.75 0 0 0-1.08.022L7.477 9.417 5.384 7.323a.75.75 0 0 0-1.06 1.06L6.97 11.03a.75.75 0 0 0 1.079-.02l3.992-4.99a.75.75 0 0 0-.01-1.05z"/></svg>
+                    Link público gerado com sucesso!
+                </div>
+                <div class="copy-group">
+                    <input type="text" id="public-url" class="form-input copy-input" readonly>
+                    <button class="btn btn-copy" id="btn-copy">Copiar</button>
+                </div>
+            </div>
+
+            <!-- Campo invisível de Honeypot para upload -->
+            <div style="display:none !important;">
+                <input type="text" id="upload-honeypot" tabindex="-1" autocomplete="off">
+            </div>
+
+            <a href="index.php?action=logout" class="btn btn-logout">Sair do Painel</a>
+        <?php endif; ?>
+
+        <?php if (!$hasComposer): ?>
+            <div class="composer-warning">
+                ⚠️ SDK do Cloudflare ausente no servidor. O uploader não funcionará até que dependências sejam instaladas.
+            </div>
+        <?php endif; ?>
+        
+    </div>
+</div>
+
+<script>
+    const dropzone = document.getElementById('dropzone');
+    const fileInput = document.getElementById('file-input');
+    const progressContainer = document.getElementById('progress-container');
+    const progressBar = document.getElementById('progress-bar');
+    const progressPercent = document.getElementById('progress-percent');
+    const fileNameDisplay = document.getElementById('file-name');
+    const resultContainer = document.getElementById('result-container');
+    const publicUrlInput = document.getElementById('public-url');
+    const btnCopy = document.getElementById('btn-copy');
+    const jsAlert = document.getElementById('js-alert');
+
+    if (dropzone && fileInput) {
+        const csrfToken = "<?= htmlspecialchars($_SESSION['csrf_token'], ENT_QUOTES, 'UTF-8') ?>";
+
+        dropzone.addEventListener('click', () => fileInput.click());
+
+        ['dragenter', 'dragover'].forEach(eventName => {
+            dropzone.addEventListener(eventName, (e) => {
+                e.preventDefault();
+                dropzone.classList.add('dragover');
+            }, false);
+        });
+
+        ['dragleave', 'drop'].forEach(eventName => {
+            dropzone.addEventListener(eventName, (e) => {
+                e.preventDefault();
+                dropzone.classList.remove('dragover');
+            }, false);
+        });
+
+        dropzone.addEventListener('drop', (e) => {
+            const dt = e.dataTransfer;
+            const files = dt.files;
+            if (files.length > 0) {
+                handleUpload(files[0]);
+            }
+        });
+
+        fileInput.addEventListener('change', (e) => {
+            if (fileInput.files.length > 0) {
+                handleUpload(fileInput.files[0]);
+            }
+        });
+
+        // Fluxo de Upload Direto via Presigned URL
+        function handleUpload(file) {
+            resultContainer.style.display = 'none';
+            showAlert('none');
+
+            // 1. Obter a URL pré-assinada do backend PHP
+            fileNameDisplay.textContent = "Preparando conexao segura...";
+            progressPercent.textContent = '0%';
+            progressBar.style.width = '0%';
+            progressContainer.style.display = 'block';
+
+            const mimeType = file.type || 'application/octet-stream';
+            const honeypotVal = document.getElementById('upload-honeypot').value;
+
+            // Solicitação de assinatura
+            fetch('index.php?action=get_presigned_url', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-CSRF-Token': csrfToken
+                },
+                body: JSON.stringify({
+                    fileName: file.name,
+                    fileSize: file.size,
+                    mimeType: mimeType,
+                    csrf_token: csrfToken,
+                    upload_honeypot: honeypotVal
+                })
+            })
+            .then(response => {
+                if (!response.ok) {
+                    return response.json().then(err => { throw new Error(err.error || 'Erro ao gerar assinatura de upload.'); });
+                }
+                return response.json();
+            })
+            .then(data => {
+                if (data.success) {
+                    // Executar o upload direto PUT para o Cloudflare R2
+                    executeDirectUpload(file, data.presignedUrl, data.publicUrl, mimeType, data.contentDisposition);
+                } else {
+                    throw new Error('Assinatura recusada pelo servidor.');
+                }
+            })
+            .catch(error => {
+                progressContainer.style.display = 'none';
+                showAlert('error', error.message || 'Falha de comunicacao com o servidor.');
+            });
+        }
+
+        // Realizar o envio PUT direto do navegador para o Cloudflare R2
+        function executeDirectUpload(file, presignedUrl, publicUrl, mimeType, contentDisposition) {
+            fileNameDisplay.textContent = "Enviando diretamente ao Cloudflare R2: " + file.name;
+            
+            const xhr = new XMLHttpRequest();
+            xhr.open('PUT', presignedUrl, true);
+            
+            // ATENÇÃO: O Content-Type DEVE coincidir exatamente com o que foi assinado no PHP
+            xhr.setRequestHeader('Content-Type', mimeType);
+            xhr.setRequestHeader('Content-Disposition', contentDisposition);
+
+            // Acompanhamento do progresso de upload
+            xhr.upload.addEventListener('progress', (e) => {
+                if (e.lengthComputable) {
+                    const percent = Math.round((e.loaded / e.total) * 100);
+                    progressBar.style.width = percent + '%';
+                    progressPercent.textContent = percent + '%';
+                }
+            });
+
+            xhr.onload = function() {
+                progressContainer.style.display = 'none';
+                // O Cloudflare R2 retorna HTTP 200 para uploads PUT bem sucedidos
+                if (xhr.status === 200 || xhr.status === 201) {
+                    publicUrlInput.value = publicUrl;
+                    resultContainer.style.display = 'block';
+                    showAlert('success', 'Upload concluido com sucesso!');
+                } else {
+                    showAlert('error', 'Falha no envio direto ao R2 (HTTP ' + xhr.status + ').');
+                }
+            };
+
+            xhr.onerror = function() {
+                progressContainer.style.display = 'none';
+                showAlert('error', 'Erro de conexao direta com o Cloudflare R2.');
+            };
+
+            // Enviar os bytes puros do arquivo
+            xhr.send(file);
+        }
+
+        // Sistema de Cópia
+        btnCopy.addEventListener('click', () => {
+            publicUrlInput.select();
+            publicUrlInput.setSelectionRange(0, 99999);
+            navigator.clipboard.writeText(publicUrlInput.value)
+                .then(() => {
+                    btnCopy.textContent = 'Copiado!';
+                    btnCopy.classList.add('success');
+                    setTimeout(() => {
+                        btnCopy.textContent = 'Copiar';
+                        btnCopy.classList.remove('success');
+                    }, 2000);
+                })
+                .catch(() => {
+                    showAlert('error', 'Nao foi possivel copiar automaticamente.');
+                });
+        });
+
+        function showAlert(type, text = '') {
+            jsAlert.className = 'alert';
+            if (type === 'none') {
+                jsAlert.style.display = 'none';
+                return;
+            }
+            jsAlert.style.display = 'flex';
+            jsAlert.classList.add('alert-' + type);
+            
+            let iconSvg = '';
+            if (type === 'success') {
+                iconSvg = '<svg width="16" height="16" fill="currentColor" viewBox="0 0 16 16"><path d="M16 8A8 8 0 1 1 0 8a8 8 0 0 1 16 0zm-3.97-3.03a.75.75 0 0 0-1.08.022L7.477 9.417 5.384 7.323a.75.75 0 0 0-1.06 1.06L6.97 11.03a.75.75 0 0 0 1.079-.02l3.992-4.99a.75.75 0 0 0-.01-1.05z"/></svg>';
+            } else {
+                iconSvg = '<svg width="16" height="16" fill="currentColor" viewBox="0 0 16 16"><path d="M8.982 1.566a1.13 1.13 0 0 0-1.96 0L.165 13.233c-.457.778.091 1.767.98 1.767h13.713c.889 0 1.438-.99.98-1.767L8.982 1.566zM8 5c.535 0 .954.462.9.995l-.35 3.507a.552.552 0 0 1-1.1 0L7.1 5.995A.905.905 0 0 1 8 5zm.002 6a1 1 0 1 1 0 2 1 1 0 0 1 0-2z"/></svg>';
+            }
+            
+            jsAlert.innerHTML = iconSvg + '<span>' + text + '</span>';
+        }
+    }
+</script>
+
+</body>
+</html>
