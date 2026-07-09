@@ -108,6 +108,23 @@ function write_log(string $message): void {
     @file_put_contents($logFile, $logMessage, FILE_APPEND);
 }
 
+// Helper para inicializar o cliente do Cloudflare R2
+function get_r2_client(array $config): Aws\S3\S3Client {
+    return new Aws\S3\S3Client([
+        'credentials' => [
+            'key'    => $config['R2_ACCESS_KEY'],
+            'secret' => $config['R2_SECRET_KEY'],
+        ],
+        'region' => 'auto',
+        'endpoint' => "https://" . $config['R2_ACCOUNT_ID'] . ".r2.cloudflarestorage.com",
+        'version' => 'latest',
+        'use_path_style_endpoint' => true,
+        'http' => [
+            'verify' => false, // Evita falhas de SSL em servidores com certificados CA desatualizados
+        ],
+    ]);
+}
+
 // Roteamento de Ações do Backend
 $error = '';
 $successLink = '';
@@ -254,19 +271,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_GET['action']) && $_GET['ac
         write_log("Preparando URL pre-assinada para arquivo original: '{$fileNameOriginal}' | Nome no R2: '{$newFileName}'");
 
         // Inicializar Cliente do Cloudflare R2
-        $s3Client = new Aws\S3\S3Client([
-            'credentials' => [
-                'key'    => $config['R2_ACCESS_KEY'],
-                'secret' => $config['R2_SECRET_KEY'],
-            ],
-            'region' => 'auto',
-            'endpoint' => "https://" . $config['R2_ACCOUNT_ID'] . ".r2.cloudflarestorage.com",
-            'version' => 'latest',
-            'use_path_style_endpoint' => true,
-            'http' => [
-                'verify' => false, // Evita falhas de SSL em servidores com certificados CA desatualizados
-            ],
-        ]);
+        $s3Client = get_r2_client($config);
 
         $bucket = $config['R2_BUCKET_NAME'];
         
@@ -309,6 +314,148 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_GET['action']) && $_GET['ac
             ? 'Erro R2: ' . $e->getMessage() 
             : 'Erro interno ao preparar a conexao com o Cloudflare R2.';
         echo json_encode(['error' => $errorMsg]);
+        exit;
+    }
+}
+
+// 4. API de Listagem de Arquivos (Somente Autenticados)
+if ($_SERVER['REQUEST_METHOD'] === 'GET' && isset($_GET['action']) && $_GET['action'] === 'list_files') {
+    header('Content-Type: application/json');
+
+    if (!$isAuthenticated) {
+        write_log("Erro de Autenticacao: Tentativa de listagem de arquivos sem login.");
+        http_response_code(403);
+        echo json_encode(['error' => 'Acesso nao autorizado. Faca o login novamente.']);
+        exit;
+    }
+
+    if (!$hasComposer) {
+        write_log("Erro no servidor: Dependencias do Composer (AWS SDK) ausentes na listagem.");
+        http_response_code(500);
+        echo json_encode(['error' => 'Dependencias do R2 ausentes no servidor.']);
+        exit;
+    }
+
+    try {
+        $s3Client = get_r2_client($config);
+        $bucket = $config['R2_BUCKET_NAME'];
+
+        // Listar objetos do bucket
+        $result = $s3Client->listObjectsV2([
+            'Bucket' => $bucket
+        ]);
+
+        $files = [];
+        if (isset($result['Contents'])) {
+            $publicBaseUrl = rtrim($config['R2_PUBLIC_URL'], '/');
+            foreach ($result['Contents'] as $object) {
+                // Ignorar diretórios fictícios (chaves que terminam com /)
+                if (substr($object['Key'], -1) === '/') {
+                    continue;
+                }
+                
+                $key = $object['Key'];
+                $size = $object['Size'];
+                
+                // Formatar tamanho amigável
+                $formattedSize = '0 B';
+                if ($size > 0) {
+                    $units = ['B', 'KB', 'MB', 'GB'];
+                    $i = floor(log($size, 1024));
+                    $formattedSize = round($size / pow(1024, $i), 2) . ' ' . $units[$i];
+                }
+
+                $files[] = [
+                    'key' => $key,
+                    'size' => $formattedSize,
+                    'last_modified' => $object['LastModified']->getTimestamp(),
+                    'url' => $publicBaseUrl . '/' . rawurlencode($key)
+                ];
+            }
+
+            // Ordenar por data de modificação decrescente (mais recentes primeiro)
+            usort($files, function($a, $b) {
+                return $b['last_modified'] <=> $a['last_modified'];
+            });
+        }
+
+        echo json_encode(['success' => true, 'files' => $files]);
+        exit;
+
+    } catch (Throwable $e) {
+        write_log("FALHA NA LISTAGEM DE ARQUIVOS: " . $e->getMessage());
+        http_response_code(500);
+        echo json_encode(['error' => 'Erro interno ao listar arquivos do Cloudflare R2.']);
+        exit;
+    }
+}
+
+// 5. API de Exclusao de Arquivo (Somente Autenticados)
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_GET['action']) && $_GET['action'] === 'delete_file') {
+    header('Content-Type: application/json');
+
+    if (!$isAuthenticated) {
+        write_log("Erro de Autenticacao: Tentativa de exclusao de arquivo sem login.");
+        http_response_code(403);
+        echo json_encode(['error' => 'Acesso nao autorizado. Faca o login novamente.']);
+        exit;
+    }
+
+    // Capturar o JSON enviado pelo navegador
+    $jsonInput = file_get_contents('php://input');
+    $requestData = json_decode($jsonInput, true);
+
+    if (!$requestData) {
+        write_log("Erro na requisicao de exclusao: JSON invalido.");
+        http_response_code(400);
+        echo json_encode(['error' => 'Dados de requisicao invalidos.']);
+        exit;
+    }
+
+    // Validação do Token CSRF
+    $csrfToken = $requestData['csrf_token'] ?? $_SERVER['HTTP_X_CSRF_TOKEN'] ?? '';
+    if (empty($csrfToken) || !safe_compare($_SESSION['csrf_token'], $csrfToken)) {
+        write_log("Erro de CSRF: Token CSRF invalido na exclusao de arquivo.");
+        http_response_code(400);
+        echo json_encode(['error' => 'Token CSRF invalido ou expirado.']);
+        exit;
+    }
+
+    $fileKey = $requestData['key'] ?? '';
+    if (empty($fileKey)) {
+        write_log("Erro na exclusao: Chave do arquivo nao informada.");
+        http_response_code(400);
+        echo json_encode(['error' => 'Chave do arquivo nao fornecida.']);
+        exit;
+    }
+
+    if (!$hasComposer) {
+        write_log("Erro no servidor: Dependencias do Composer (AWS SDK) ausentes na exclusao.");
+        http_response_code(500);
+        echo json_encode(['error' => 'Dependencias do R2 ausentes no servidor.']);
+        exit;
+    }
+
+    try {
+        write_log("Tentando excluir arquivo do R2: '{$fileKey}'");
+
+        $s3Client = get_r2_client($config);
+        $bucket = $config['R2_BUCKET_NAME'];
+
+        // Excluir o objeto do R2
+        $s3Client->deleteObject([
+            'Bucket' => $bucket,
+            'Key'    => $fileKey
+        ]);
+
+        write_log("Arquivo '{$fileKey}' excluido com sucesso do R2.");
+        echo json_encode(['success' => true]);
+        exit;
+
+    } catch (Throwable $e) {
+        write_log("FALHA NA EXCLUSAO DO ARQUIVO: " . $e->getMessage());
+        http_response_code(500);
+        echo json_encode(['error' => 'Erro interno ao excluir o arquivo do Cloudflare R2.']);
         exit;
     }
 }
@@ -666,11 +813,415 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_GET['action']) && $_GET['ac
             from { opacity: 0; transform: translateY(8px); }
             to { opacity: 1; transform: translateY(0); }
         }
+
+        /* Estilos adicionais para galeria e toasts */
+        .container.container-wide {
+            max-width: 1000px;
+        }
+
+        .dashboard-grid {
+            display: grid;
+            grid-template-columns: 1fr;
+            gap: 2rem;
+            width: 100%;
+        }
+
+        @media (min-width: 820px) {
+            .dashboard-grid {
+                grid-template-columns: 380px 1fr;
+                align-items: start;
+            }
+        }
+
+        .uploader-section {
+            display: flex;
+            flex-direction: column;
+            gap: 1.25rem;
+        }
+
+        .gallery-section {
+            display: flex;
+            flex-direction: column;
+            border-left: none;
+            padding-left: 0;
+            width: 100%;
+        }
+
+        @media (min-width: 820px) {
+            .gallery-section {
+                border-left: 1px solid var(--border-color);
+                padding-left: 2rem;
+            }
+        }
+
+        /* Botão de atualização */
+        .btn-refresh {
+            background: transparent;
+            border: 1px solid var(--border-color);
+            color: var(--text-secondary);
+            width: 34px;
+            height: 34px;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            cursor: pointer;
+            transition: all 0.2s ease;
+        }
+
+        .btn-refresh:hover {
+            color: var(--text-primary);
+            border-color: var(--text-secondary);
+            background-color: rgba(255, 255, 255, 0.05);
+        }
+
+        .btn-refresh svg {
+            transition: transform 0.5s ease;
+        }
+
+        .btn-refresh.spinning svg {
+            animation: spin 1s linear infinite;
+        }
+
+        @keyframes spin {
+            100% { transform: rotate(360deg); }
+        }
+
+        /* Caixa de busca */
+        .search-box {
+            position: relative;
+            margin-bottom: 1.25rem;
+            width: 100%;
+        }
+
+        .search-icon {
+            position: absolute;
+            left: 14px;
+            top: 50%;
+            transform: translateY(-50%);
+            color: var(--text-secondary);
+            pointer-events: none;
+        }
+
+        .search-input {
+            padding-left: 2.5rem !important;
+            height: 42px;
+            font-size: 0.875rem !important;
+        }
+
+        /* Lista da Galeria */
+        .gallery-list {
+            display: flex;
+            flex-direction: column;
+            gap: 0.75rem;
+            max-height: 450px;
+            overflow-y: auto;
+            padding-right: 0.25rem;
+        }
+
+        .gallery-list::-webkit-scrollbar {
+            width: 6px;
+        }
+
+        .gallery-list::-webkit-scrollbar-track {
+            background: rgba(31, 41, 55, 0.2);
+            border-radius: 99px;
+        }
+
+        .gallery-list::-webkit-scrollbar-thumb {
+            background: var(--border-color);
+            border-radius: 99px;
+        }
+
+        .gallery-list::-webkit-scrollbar-thumb:hover {
+            background: var(--text-secondary);
+        }
+
+        .gallery-empty {
+            text-align: center;
+            color: var(--text-secondary);
+            padding: 3rem 1rem;
+            font-size: 0.875rem;
+            border: 1px dashed var(--border-color);
+            border-radius: 12px;
+            background-color: rgba(31, 41, 55, 0.1);
+        }
+
+        /* Item de arquivo */
+        .file-item {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 0.75rem 1rem;
+            background-color: rgba(31, 41, 55, 0.3);
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            transition: all 0.2s ease;
+        }
+
+        .file-item:hover {
+            border-color: rgba(99, 102, 241, 0.4);
+            background-color: rgba(31, 41, 55, 0.5);
+            transform: translateY(-1px);
+        }
+
+        .file-info {
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+            flex-grow: 1;
+            min-width: 0;
+        }
+
+        .file-icon {
+            width: 36px;
+            height: 36px;
+            background-color: rgba(99, 102, 241, 0.1);
+            color: var(--accent-start);
+            border-radius: 8px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            flex-shrink: 0;
+            overflow: hidden;
+        }
+
+        .file-icon-img {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+        }
+
+        .file-meta {
+            display: flex;
+            flex-direction: column;
+            min-width: 0;
+        }
+
+        .file-name {
+            font-size: 0.875rem;
+            font-weight: 500;
+            color: var(--text-primary);
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            text-decoration: none;
+        }
+
+        .file-name:hover {
+            color: var(--accent-end);
+        }
+
+        .file-details {
+            font-size: 0.75rem;
+            color: var(--text-secondary);
+            margin-top: 0.125rem;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        .file-dot {
+            width: 3px;
+            height: 3px;
+            background-color: var(--text-secondary);
+            border-radius: 50%;
+        }
+
+        .file-actions {
+            display: flex;
+            gap: 0.5rem;
+            flex-shrink: 0;
+            margin-left: 0.75rem;
+        }
+
+        .btn-action {
+            width: 32px;
+            height: 32px;
+            border-radius: 8px;
+            border: 1px solid var(--border-color);
+            background: rgba(31, 41, 55, 0.6);
+            color: var(--text-secondary);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            cursor: pointer;
+            transition: all 0.2s ease;
+        }
+
+        .btn-action-copy:hover {
+            background-color: rgba(16, 185, 129, 0.1);
+            border-color: rgba(16, 185, 129, 0.3);
+            color: var(--success-color);
+        }
+
+        .btn-action-delete:hover {
+            background-color: rgba(239, 68, 68, 0.1);
+            border-color: rgba(239, 68, 68, 0.3);
+            color: var(--error-color);
+        }
+
+        /* Notificações Toasts */
+        .toast-container {
+            position: fixed;
+            bottom: 1.5rem;
+            right: 1.5rem;
+            display: flex;
+            flex-direction: column;
+            gap: 0.75rem;
+            z-index: 9999;
+            pointer-events: none;
+        }
+
+        .toast {
+            pointer-events: auto;
+            background-color: rgba(11, 17, 30, 0.95);
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            padding: 0.875rem 1.25rem;
+            box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.6);
+            backdrop-filter: blur(8px);
+            -webkit-backdrop-filter: blur(8px);
+            color: var(--text-primary);
+            font-size: 0.875rem;
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+            min-width: 280px;
+            max-width: 380px;
+            transform: translateY(20px);
+            opacity: 0;
+            animation: toastIn 0.3s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+        }
+
+        .toast-success {
+            border-left: 3px solid var(--success-color);
+        }
+
+        .toast-error {
+            border-left: 3px solid var(--error-color);
+        }
+
+        .toast-info {
+            border-left: 3px solid var(--accent-start);
+        }
+
+        .toast.fade-out {
+            animation: toastOut 0.3s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+        }
+
+        @keyframes toastIn {
+            to {
+                transform: translateY(0);
+                opacity: 1;
+            }
+        }
+
+        @keyframes toastOut {
+            to {
+                transform: translateY(10px);
+                opacity: 0;
+            }
+        }
+
+        /* Modal Customizado */
+        .modal-overlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100vw;
+            height: 100vh;
+            background-color: rgba(0, 0, 0, 0.6);
+            backdrop-filter: blur(4px);
+            -webkit-backdrop-filter: blur(4px);
+            z-index: 9998;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            opacity: 0;
+            pointer-events: none;
+            transition: opacity 0.2s ease;
+        }
+
+        .modal-overlay.active {
+            opacity: 1;
+            pointer-events: auto;
+        }
+
+        .modal-box {
+            background-color: #0b111e;
+            border: 1px solid var(--border-color);
+            border-radius: 16px;
+            padding: 1.75rem;
+            width: 90%;
+            max-width: 400px;
+            box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.8);
+            transform: scale(0.95);
+            transition: transform 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+        }
+
+        .modal-overlay.active .modal-box {
+            transform: scale(1);
+        }
+
+        .modal-title {
+            font-size: 1.15rem;
+            font-weight: 600;
+            color: var(--text-primary);
+            margin-bottom: 0.75rem;
+        }
+
+        .modal-message {
+            font-size: 0.875rem;
+            color: var(--text-secondary);
+            line-height: 1.5;
+            margin-bottom: 1.5rem;
+        }
+
+        .modal-actions {
+            display: flex;
+            justify-content: flex-end;
+            gap: 0.75rem;
+        }
+
+        .btn-modal {
+            padding: 0.625rem 1.125rem;
+            border-radius: 8px;
+            font-size: 0.875rem;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.2s ease;
+            outline: none;
+        }
+
+        .btn-modal-cancel {
+            background: transparent;
+            border: 1px solid var(--border-color);
+            color: var(--text-secondary);
+        }
+
+        .btn-modal-cancel:hover {
+            background-color: rgba(255, 255, 255, 0.05);
+            color: var(--text-primary);
+            border-color: var(--text-secondary);
+        }
+
+        .btn-modal-confirm {
+            background-color: var(--error-color);
+            border: none;
+            color: white;
+            box-shadow: 0 4px 12px rgba(239, 68, 68, 0.2);
+        }
+
+        .btn-modal-confirm:hover {
+            background-color: #dc2626;
+            box-shadow: 0 6px 16px rgba(239, 68, 68, 0.3);
+        }
     </style>
 </head>
 <body>
 
-<div class="container">
+<div class="container <?= $isAuthenticated ? 'container-wide' : '' ?>">
     <div class="card">
         
         <?php if (!$isAuthenticated): ?>
@@ -705,57 +1256,90 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_GET['action']) && $_GET['ac
             </form>
 
         <?php else: ?>
-            <!-- PAINEL DE UPLOAD (AUTENTICADO) -->
-            <div class="card-header">
-                <h1 class="card-title">Carregar Arquivo</h1>
-                <p class="card-subtitle">Suba arquivos de grande porte direto para o Cloudflare R2</p>
-            </div>
+            <!-- Dashboard Layout Grid -->
+            <div class="dashboard-grid">
+                <!-- Coluna Esquerda: Uploader -->
+                <div class="uploader-section">
+                    <div class="card-header" style="text-align: left; margin-bottom: 1.5rem;">
+                        <h1 class="card-title">Carregar Arquivo</h1>
+                        <p class="card-subtitle">Suba arquivos direto para o Cloudflare R2</p>
+                    </div>
 
-            <div id="js-alert" class="alert" style="display: none;"></div>
+                    <div id="js-alert" class="alert" style="display: none;"></div>
 
-            <!-- Dropzone central -->
-            <div class="dropzone" id="dropzone">
-                <svg class="dropzone-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
-                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12"></path>
-                </svg>
-                <p class="dropzone-text">
-                    <strong>Clique para selecionar</strong> ou arraste o arquivo aqui.<br>
-                    <span style="font-size: 0.75rem; color: var(--text-secondary);">
-                        Extensões seguras permitidas (incluindo .exe)
-                    </span>
-                </p>
-                <input type="file" id="file-input" class="file-input">
-            </div>
+                    <!-- Dropzone central -->
+                    <div class="dropzone" id="dropzone">
+                        <svg class="dropzone-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12"></path>
+                        </svg>
+                        <p class="dropzone-text">
+                            <strong>Clique para selecionar</strong> ou arraste o arquivo aqui.<br>
+                            <span style="font-size: 0.75rem; color: var(--text-secondary);">
+                                Extensões seguras permitidas (incluindo .exe)
+                            </span>
+                        </p>
+                        <input type="file" id="file-input" class="file-input">
+                    </div>
 
-            <!-- Barra de Progresso -->
-            <div class="progress-container" id="progress-container">
-                <div class="progress-header">
-                    <span id="file-name">Carregando arquivo...</span>
-                    <span id="progress-percent">0%</span>
+                    <!-- Barra de Progresso -->
+                    <div class="progress-container" id="progress-container">
+                        <div class="progress-header">
+                            <span id="file-name">Carregando arquivo...</span>
+                            <span id="progress-percent">0%</span>
+                        </div>
+                        <div class="progress-bar-wrapper">
+                            <div class="progress-bar" id="progress-bar"></div>
+                        </div>
+                    </div>
+
+                    <!-- Resultado com link copiável -->
+                    <div class="result-container" id="result-container">
+                        <div class="result-title">
+                            <svg width="16" height="16" fill="currentColor" viewBox="0 0 16 16"><path d="M16 8A8 8 0 1 1 0 8a8 8 0 0 1 16 0zm-3.97-3.03a.75.75 0 0 0-1.08.022L7.477 9.417 5.384 7.323a.75.75 0 0 0-1.06 1.06L6.97 11.03a.75.75 0 0 0 1.079-.02l3.992-4.99a.75.75 0 0 0-.01-1.05z"/></svg>
+                            Link público gerado com sucesso!
+                        </div>
+                        <div class="copy-group">
+                            <input type="text" id="public-url" class="form-input copy-input" readonly>
+                            <button class="btn btn-copy" id="btn-copy">Copiar</button>
+                        </div>
+                    </div>
+
+                    <!-- Campo invisível de Honeypot para upload -->
+                    <div style="display:none !important;">
+                        <input type="text" id="upload-honeypot" tabindex="-1" autocomplete="off">
+                    </div>
+
+                    <a href="index.php?action=logout" class="btn btn-logout">Sair do Painel</a>
                 </div>
-                <div class="progress-bar-wrapper">
-                    <div class="progress-bar" id="progress-bar"></div>
+
+                <!-- Coluna Direita: Galeria de Arquivos -->
+                <div class="gallery-section">
+                    <div class="card-header" style="text-align: left; margin-bottom: 1.5rem; display: flex; justify-content: space-between; align-items: center; gap: 1rem;">
+                        <div>
+                            <h2 class="card-title" style="font-size: 1.25rem; margin-bottom: 0.25rem;">Arquivos no Bucket</h2>
+                            <p class="card-subtitle">Gerencie os arquivos armazenados no R2</p>
+                        </div>
+                        <button id="btn-refresh-gallery" class="btn-refresh" title="Atualizar Galeria">
+                            <svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+                                <path stroke-linecap="round" stroke-linejoin="round" d="M16.023 9.348h4.992v-.001M2.985 19.644v-4.992m0 0h4.992m-4.993 0l3.181 3.183a8.25 8.25 0 0013.803-3.7M4.031 9.865a8.25 8.25 0 0113.803-3.7l3.181 3.182m0-4.991v4.99"></path>
+                            </svg>
+                        </button>
+                    </div>
+
+                    <!-- Barra de pesquisa da galeria -->
+                    <div class="search-box">
+                        <svg class="search-icon" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+                            <path stroke-linecap="round" stroke-linejoin="round" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"></path>
+                        </svg>
+                        <input type="text" id="gallery-search" class="form-input search-input" placeholder="Pesquisar arquivos...">
+                    </div>
+
+                    <!-- Lista de arquivos da galeria -->
+                    <div class="gallery-list" id="gallery-list">
+                        <div class="gallery-empty">Carregando galeria...</div>
+                    </div>
                 </div>
             </div>
-
-            <!-- Resultado com link copiável -->
-            <div class="result-container" id="result-container">
-                <div class="result-title">
-                    <svg width="16" height="16" fill="currentColor" viewBox="0 0 16 16"><path d="M16 8A8 8 0 1 1 0 8a8 8 0 0 1 16 0zm-3.97-3.03a.75.75 0 0 0-1.08.022L7.477 9.417 5.384 7.323a.75.75 0 0 0-1.06 1.06L6.97 11.03a.75.75 0 0 0 1.079-.02l3.992-4.99a.75.75 0 0 0-.01-1.05z"/></svg>
-                    Link público gerado com sucesso!
-                </div>
-                <div class="copy-group">
-                    <input type="text" id="public-url" class="form-input copy-input" readonly>
-                    <button class="btn btn-copy" id="btn-copy">Copiar</button>
-                </div>
-            </div>
-
-            <!-- Campo invisível de Honeypot para upload -->
-            <div style="display:none !important;">
-                <input type="text" id="upload-honeypot" tabindex="-1" autocomplete="off">
-            </div>
-
-            <a href="index.php?action=logout" class="btn btn-logout">Sair do Painel</a>
         <?php endif; ?>
 
         <?php if (!$hasComposer): ?>
@@ -764,6 +1348,21 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_GET['action']) && $_GET['ac
             </div>
         <?php endif; ?>
         
+    </div>
+</div>
+
+<!-- Toast Container para Notificações -->
+<div class="toast-container" id="toast-container"></div>
+
+<!-- Modal de Confirmação Customizado para Deleção -->
+<div class="modal-overlay" id="confirm-modal">
+    <div class="modal-box">
+        <h3 class="modal-title">Excluir Arquivo</h3>
+        <p class="modal-message">Você tem certeza que deseja excluir permanentemente o arquivo <strong id="modal-file-name" style="color: var(--text-primary); word-break: break-all;"></strong> do Cloudflare R2?</p>
+        <div class="modal-actions">
+            <button class="btn-modal btn-modal-cancel" id="btn-modal-cancel">Cancelar</button>
+            <button class="btn-modal btn-modal-confirm" id="btn-modal-confirm">Sim, Excluir</button>
+        </div>
     </div>
 </div>
 
@@ -778,6 +1377,16 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_GET['action']) && $_GET['ac
     const publicUrlInput = document.getElementById('public-url');
     const btnCopy = document.getElementById('btn-copy');
     const jsAlert = document.getElementById('js-alert');
+
+    // Elementos da Galeria e Toasts
+    const btnRefreshGallery = document.getElementById('btn-refresh-gallery');
+    const gallerySearch = document.getElementById('gallery-search');
+    const galleryList = document.getElementById('gallery-list');
+    const confirmModal = document.getElementById('confirm-modal');
+    const modalFileName = document.getElementById('modal-file-name');
+    const btnModalCancel = document.getElementById('btn-modal-cancel');
+    const btnModalConfirm = document.getElementById('btn-modal-confirm');
+    const toastContainer = document.getElementById('toast-container');
 
     if (dropzone && fileInput) {
         const csrfToken = "<?= htmlspecialchars($_SESSION['csrf_token'], ENT_QUOTES, 'UTF-8') ?>";
@@ -888,6 +1497,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_GET['action']) && $_GET['ac
                     publicUrlInput.value = publicUrl;
                     resultContainer.style.display = 'block';
                     showAlert('success', 'Upload concluido com sucesso!');
+                    loadGallery(); // Atualizar galeria pós-upload
                 } else {
                     showAlert('error', 'Falha no envio direto ao R2 (HTTP ' + xhr.status + ').');
                 }
@@ -902,7 +1512,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_GET['action']) && $_GET['ac
             xhr.send(file);
         }
 
-        // Sistema de Cópia
+        // Sistema de Cópia do Link do Uploader Principal
         btnCopy.addEventListener('click', () => {
             publicUrlInput.select();
             publicUrlInput.setSelectionRange(0, 99999);
@@ -910,6 +1520,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_GET['action']) && $_GET['ac
                 .then(() => {
                     btnCopy.textContent = 'Copiado!';
                     btnCopy.classList.add('success');
+                    showToast('Link público copiado com sucesso!', 'success');
                     setTimeout(() => {
                         btnCopy.textContent = 'Copiar';
                         btnCopy.classList.remove('success');
@@ -917,6 +1528,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_GET['action']) && $_GET['ac
                 })
                 .catch(() => {
                     showAlert('error', 'Nao foi possivel copiar automaticamente.');
+                    showToast('Erro ao copiar link.', 'error');
                 });
         });
 
@@ -938,6 +1550,241 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_GET['action']) && $_GET['ac
             
             jsAlert.innerHTML = iconSvg + '<span>' + text + '</span>';
         }
+
+        // --- SISTEMA DE TOASTS ---
+        function showToast(message, type = 'success') {
+            if (!toastContainer) return;
+            const toast = document.createElement('div');
+            toast.className = `toast toast-${type}`;
+            
+            let iconSvg = '';
+            if (type === 'success') {
+                iconSvg = `<svg width="16" height="16" fill="currentColor" viewBox="0 0 16 16"><path d="M16 8A8 8 0 1 1 0 8a8 8 0 0 1 16 0zm-3.97-3.03a.75.75 0 0 0-1.08.022L7.477 9.417 5.384 7.323a.75.75 0 0 0-1.06 1.06L6.97 11.03a.75.75 0 0 0 1.079-.02l3.992-4.99a.75.75 0 0 0-.01-1.05z"/></svg>`;
+            } else if (type === 'error') {
+                iconSvg = `<svg width="16" height="16" fill="currentColor" viewBox="0 0 16 16"><path d="M8.982 1.566a1.13 1.13 0 0 0-1.96 0L.165 13.233c-.457.778.091 1.767.98 1.767h13.713c.889 0 1.438-.99.98-1.767L8.982 1.566zM8 5c.535 0 .954.462.9.995l-.35 3.507a.552.552 0 0 1-1.1 0L7.1 5.995A.905.905 0 0 1 8 5zm.002 6a1 1 0 1 1 0 2 1 1 0 0 1 0-2z"/></svg>`;
+            } else {
+                iconSvg = `<svg width="16" height="16" fill="currentColor" viewBox="0 0 16 16"><path d="M8 16A8 8 0 1 0 8 0a8 8 0 0 0 0 16zm.93-9.412-1 4.705c-.07.34.029.533.304.533.194 0 .487-.07.686-.246l-.088.416c-.287.346-.92.598-1.465.598-.703 0-1.002-.422-.808-1.319l.738-3.468c.064-.293.006-.399-.287-.47l-.451-.081.082-.381 2.29-.287zM8 5.5a1 1 0 1 1 0-2 1 1 0 0 1 0 2z"/></svg>`;
+            }
+            
+            toast.innerHTML = `${iconSvg}<span>${message}</span>`;
+            toastContainer.appendChild(toast);
+            
+            setTimeout(() => {
+                toast.classList.add('fade-out');
+                toast.addEventListener('animationend', () => {
+                    toast.remove();
+                });
+            }, 3500);
+        }
+
+        // --- SISTEMA DA GALERIA ---
+        let allFiles = [];
+        let fileToDelete = null;
+
+        function loadGallery() {
+            if (!galleryList) return;
+            
+            if (btnRefreshGallery) {
+                btnRefreshGallery.classList.add('spinning');
+            }
+            
+            fetch('index.php?action=list_files')
+                .then(response => {
+                    if (!response.ok) throw new Error('Falha ao obter lista de arquivos.');
+                    return response.json();
+                })
+                .then(data => {
+                    if (data.success) {
+                        allFiles = data.files || [];
+                        renderGallery(allFiles);
+                    } else {
+                        throw new Error(data.error || 'Erro desconhecido ao carregar galeria.');
+                    }
+                })
+                .catch(error => {
+                    galleryList.innerHTML = `<div class="gallery-empty" style="color: var(--error-color); border-color: rgba(239, 68, 68, 0.2);">
+                        ⚠️ Falha ao carregar galeria: ${error.message}
+                    </div>`;
+                    showToast('Erro ao carregar arquivos da galeria.', 'error');
+                })
+                .finally(() => {
+                    if (btnRefreshGallery) {
+                        setTimeout(() => btnRefreshGallery.classList.remove('spinning'), 300);
+                    }
+                });
+        }
+
+        function renderGallery(files) {
+            if (!galleryList) return;
+            
+            if (files.length === 0) {
+                galleryList.innerHTML = '<div class="gallery-empty">Nenhum arquivo encontrado no bucket R2.</div>';
+                return;
+            }
+            
+            galleryList.innerHTML = '';
+            
+            files.forEach(file => {
+                const item = document.createElement('div');
+                item.className = 'file-item';
+                
+                const ext = file.key.split('.').pop().toLowerCase();
+                let iconHtml = '';
+                const isImage = ['jpg', 'jpeg', 'png', 'gif', 'webp'].includes(ext);
+                
+                if (isImage) {
+                    iconHtml = `<img src="${file.url}" class="file-icon-img" alt="" loading="lazy" onerror="this.outerHTML='🖼️'">`;
+                } else {
+                    switch(ext) {
+                        case 'pdf': iconHtml = '📄'; break;
+                        case 'zip':
+                        case 'rar':
+                        case '7z': iconHtml = '📦'; break;
+                        case 'exe': iconHtml = '⚙️'; break;
+                        case 'mp4': iconHtml = '🎥'; break;
+                        case 'txt':
+                        case 'csv': iconHtml = '📝'; break;
+                        default: iconHtml = '📎';
+                    }
+                }
+                
+                item.innerHTML = `
+                    <div class="file-info">
+                        <div class="file-icon">${iconHtml}</div>
+                        <div class="file-meta">
+                            <a href="${file.url}" target="_blank" class="file-name" title="${file.key}">${file.key}</a>
+                            <div class="file-details">
+                                <span>${file.size}</span>
+                                <span class="file-dot"></span>
+                                <span>${new Date(file.last_modified * 1000).toLocaleDateString('pt-BR')}</span>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="file-actions">
+                        <button class="btn-action btn-action-copy" data-url="${file.url}" title="Copiar Link">
+                            <svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+                                <path stroke-linecap="round" stroke-linejoin="round" d="M8 5H6a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2v-1M8 5a2 2 0 002 2h2a2 2 0 002-2M8 5a2 2 0 002 2h2a2 2 0 002-2m0 0h2a2 2 0 012 2v3m2 4H10m0 0l3-3m-3 3l3 3"></path>
+                            </svg>
+                        </button>
+                        <button class="btn-action btn-action-delete" data-key="${encodeURIComponent(file.key)}" data-display-key="${file.key}" title="Excluir Arquivo">
+                            <svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+                                <path stroke-linecap="round" stroke-linejoin="round" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path>
+                            </svg>
+                        </button>
+                    </div>
+                `;
+                
+                // Evento de Cópia
+                item.querySelector('.btn-action-copy').addEventListener('click', (e) => {
+                    const button = e.currentTarget;
+                    const url = button.getAttribute('data-url');
+                    navigator.clipboard.writeText(url)
+                        .then(() => {
+                            showToast('Link copiado com sucesso!', 'success');
+                            button.style.color = 'var(--success-color)';
+                            button.style.borderColor = 'rgba(16, 185, 129, 0.3)';
+                            setTimeout(() => {
+                                button.style.color = '';
+                                button.style.borderColor = '';
+                            }, 2000);
+                        })
+                        .catch(() => showToast('Erro ao copiar link.', 'error'));
+                });
+                
+                // Evento de Deleção
+                item.querySelector('.btn-action-delete').addEventListener('click', (e) => {
+                    const key = decodeURIComponent(e.currentTarget.getAttribute('data-key'));
+                    openDeleteModal(key);
+                });
+                
+                galleryList.appendChild(item);
+            });
+        }
+
+        // --- SISTEMA DE CONFIRMAÇÃO DE EXCLUSÃO ---
+        function openDeleteModal(key) {
+            fileToDelete = key;
+            if (modalFileName) modalFileName.textContent = key;
+            if (confirmModal) confirmModal.classList.add('active');
+        }
+
+        function closeDeleteModal() {
+            fileToDelete = null;
+            if (confirmModal) confirmModal.classList.remove('active');
+        }
+
+        if (btnModalCancel) {
+            btnModalCancel.addEventListener('click', closeDeleteModal);
+        }
+
+        if (confirmModal) {
+            confirmModal.addEventListener('click', (e) => {
+                if (e.target === confirmModal) closeDeleteModal();
+            });
+        }
+
+        if (btnModalConfirm) {
+            btnModalConfirm.addEventListener('click', () => {
+                if (!fileToDelete) return;
+                
+                btnModalConfirm.disabled = true;
+                btnModalConfirm.textContent = 'Excluindo...';
+                
+                fetch('index.php?action=delete_file', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'X-CSRF-Token': csrfToken
+                    },
+                    body: JSON.stringify({
+                        key: fileToDelete,
+                        csrf_token: csrfToken
+                    })
+                })
+                .then(response => {
+                    if (!response.ok) {
+                        return response.json().then(err => { throw new Error(err.error || 'Erro ao excluir o arquivo.'); });
+                    }
+                    return response.json();
+                })
+                .then(data => {
+                    if (data.success) {
+                        showToast('Arquivo excluído com sucesso!', 'success');
+                        loadGallery();
+                    } else {
+                        throw new Error('Falha na deleção.');
+                    }
+                })
+                .catch(error => {
+                    showToast(error.message || 'Falha ao deletar arquivo.', 'error');
+                })
+                .finally(() => {
+                    btnModalConfirm.disabled = false;
+                    btnModalConfirm.textContent = 'Sim, Excluir';
+                    closeDeleteModal();
+                });
+            });
+        }
+
+        // --- SISTEMA DE PESQUISA E ATUALIZAÇÃO ---
+        if (gallerySearch) {
+            gallerySearch.addEventListener('input', (e) => {
+                const query = e.target.value.toLowerCase().trim();
+                if (query === '') {
+                    renderGallery(allFiles);
+                } else {
+                    const filtered = allFiles.filter(file => file.key.toLowerCase().includes(query));
+                    renderGallery(filtered);
+                }
+            });
+        }
+
+        if (btnRefreshGallery) {
+            btnRefreshGallery.addEventListener('click', loadGallery);
+        }
+
+        // Carregar galeria no início
+        loadGallery();
     }
 </script>
 
